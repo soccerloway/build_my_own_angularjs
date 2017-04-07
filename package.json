@@ -1,0 +1,44 @@
+{
+  "name": "build_my_own_angularjs",
+  "version": "1.0.0",
+  "description": "study angularjs to next level",
+  "main": "index.js",
+  "scripts": {
+    "test": "karma start",
+    "lint": "jshint src"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/soccerloway/build_my_own_angularjs.git"
+  },
+  "keywords": [
+    "angularjs",
+    "build",
+    "your",
+    "own",
+    "angularjs"
+  ],
+  "author": "luowei",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/soccerloway/build_my_own_angularjs/issues"
+  },
+  "homepage": "https://github.com/soccerloway/build_my_own_angularjs#readme",
+  "dependencies": {
+    "jquery": "^3.2.1",
+    "lodash": "^4.17.4"
+  },
+  "devDependencies": {
+    "browserify": "^14.3.0",
+    "jasmine-core": "^2.5.2",
+    "jshint": "^2.9.4",
+    "karma": "^1.6.0",
+    "karma-browserify": "^5.1.1",
+    "karma-jasmine": "^1.1.0",
+    "karma-jshint-preprocessor": "0.0.6",
+    "karma-phantomjs-launcher": "^1.0.4",
+    "phantomjs-prebuilt": "^2.1.14",
+    "sinon": "^2.1.0",
+    "watchify": "^3.9.0"
+  }
+}
