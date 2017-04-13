@@ -16,6 +16,8 @@ function Scope() {
 	this.$$phase = null; // 储存scope上正在做什么,值有：digest/apply/null
 	this.$root = this; // rootScope
 
+	this.$$listeners = {}; // 存储包含自定义事件键值对的对象
+
 	this.$$children = []; // 存储当前scope的儿子Scope,以便$digest循环递归
 }
 
@@ -90,6 +92,111 @@ Scope.prototype.$watchGroup = function(watchFns, listenerFn) {
 			destroyFunction();
 		});
 	};
+};
+
+/* $watchCollection 代码比较杂乱，都是些分类处理代码
+	这个方法主要在 watch 大型数组，对象时，能够提高效率，
+	针对数据size进行的判断，减少了循环。效率远高于$watch的deep watch.
+	这个方法貌似被叫做 shallow collection-watching.
+ */
+Scope.prototype.$watchCollection = function(watchFn, listenerFn) {
+	var self = this;
+	var newValue;
+	var oldValue;
+	var oldLength;
+	var veryOldValue;
+	var trackVeryOldValue = (listenerFn.length > 1);
+	var changeCount = 0;
+	var firstRun = true;
+
+	function isArrayLike(obj) {
+		if(_.isNull(obj) || _.isUndefined(obj)) {
+			return false;
+		}
+		var length = obj.length;
+		return length === 0 || (_.isNumber(length) && length > 0 && (length - 1) in obj);
+	}
+
+	var internalWatchFn = function(scope) {
+		var newLength;
+		newValue = watchFn(scope);
+
+		if(_.isObject(newValue)) {
+			if(isArrayLike(newValue)) {
+				if(!_.isArray(oldValue)) {
+					changeCount++;
+					oldValue = [];
+				}
+				if(newValue.length !== oldValue.length) {
+					changeCount++;
+					oldValue.length = newValue.length;
+				}
+				_.forEach(newValue, function(newItem, i) {
+					var bothNaN = _.isNaN(newItem) && _.isNaN(oldValue[i]);
+
+					if(!bothNaN && newItem !== oldValue[i]) {
+						changeCount++;
+						oldValue[i] = newItem;
+					}
+				});
+			} else {
+				if(!_.isObject(oldValue) || isArrayLike(oldValue)) {
+					changeCount++;
+					oldValue = {};
+					oldLength = 0;
+				}
+				newLength = 0;
+
+				_.forOwn(newValue, function(newVal, key) {
+					newLength++;
+
+					if(oldValue.hasOwnProperty(key)) {
+						var bothNaN = _.isNaN(newVal) && _.isNaN(oldValue[key]);
+						if(!bothNaN && oldValue[key] !== newVal) {
+							changeCount++;
+							oldValue[key] = newVal;
+						}
+					} else {
+						changeCount++;
+						oldLength++;
+						oldValue[key] = newVal;
+					}
+				});
+
+				if(oldLength > newLength) {
+					changeCount++;
+					_.forOwn(oldValue, function(oldVal, key) {
+						if(!newValue.hasOwnProperty(key)) {
+							oldLength--;
+							delete oldValue[key];
+						}
+					});
+				}
+			}
+		} else {
+			if(!self.$$areEqual(newValue, oldValue, false)) {
+				changeCount++;
+			}
+			oldValue = newValue;
+		}
+
+		return changeCount;
+	};
+
+	var internalListenerFn = function() {
+		if(firstRun) {
+			listenerFn(newValue, newValue, self);
+			firstRun = false;
+		} else {
+			listenerFn(newValue, veryOldValue, self);
+		}
+
+		if (trackVeryOldValue) {
+			veryOldValue = _.clone(newValue);
+		}
+	};
+
+	return this.$watch(internalWatchFn, internalListenerFn);
 };
 
 /* $digestOnce方法: 遍历scope的watchers数组，并调用对应listener函数 */
@@ -257,7 +364,7 @@ Scope.prototype.$$flushApplyAsync = function() {
 		}
 	}
 	this.$root.$$applyAsyncId = null;
-}
+};
 /* Scope原型继承部分的方法 */
 Scope.prototype.$new = function(isolated, parent) {
 	var child;
@@ -278,14 +385,16 @@ Scope.prototype.$new = function(isolated, parent) {
 	parent.$$children.push(child);
 
 	child.$$watchers = []; // shadow这个prop,使成为每个scope独立拥有这个prop
+	child.$$listeners = {}; // shadow这个prop, 存储包含自定义事件键值对的对象 
 	child.$$children = []; // shadow这个prop,使成为每个scope独立拥有这个prop
 	child.$parent = parent; // 缓存parentScope, 以便让scope上的其他method能够使用它，比如$destroy
 
 	return child;
 };
 
-/*  */
+/* scope的销毁方法，依赖 $broadcast 通知children */
 Scope.prototype.$destroy = function() {
+	this.$broadcast('$destroy');
 	if(this.$parent) {
 		var siblings = this.$parent.$$children;
 		var indexOfThis = siblings.indexOf(this);
@@ -295,9 +404,12 @@ Scope.prototype.$destroy = function() {
 	}
 
 	this.$$watchers = null;
-}
+	this.$$listeners = {};
+};
 
-/* 为使$digest循环能够递归child scope上的watchers的工具方法 */
+/* 为使$digest循环能够递归child scope上的watchers的工具方法 
+   这个方法还用于实现$broadcast
+*/
 Scope.prototype.$$everyScope = function(fn) {
 	if(fn(this)) {
 		return this.$$children.every(function(child) {
@@ -308,8 +420,102 @@ Scope.prototype.$$everyScope = function(fn) {
 	}
 };
 
+/*
+ angularjs event system: publish-subscribe 发布者/订阅者 模式
+*/
+Scope.prototype.$on = function(eventName, listener) {
+	var listeners = this.$$listeners[eventName];
 
+	if(!listeners) {
+		this.$$listeners[eventName] = listeners = [];
+	}
 
+	listeners.push(listener);
 
+	return function(eventName) {
+		var index = listeners.indexOf(listener);
+		
+		if(index >= 0) {
+			listeners[index] = null;
+		}
+	};
+};
+
+/* propagating up */
+Scope.prototype.$emit = function(eventName) {
+	var propagationStopped = false;
+	var event = {
+		name: eventName,
+		targetScope: this,
+		stopPropagation: function() {
+			propagationStopped = true;
+		},
+		preventDefault: function() {
+			event.defaultPrevented = true;
+		}
+	};
+
+	//  把event和additionalArgs拼接成新数组，通过apply方法传入listener, 使参数获取方式正常
+	var listenerArgs = [event].concat(_.tail(arguments));
+	var scope = this;
+
+	do {
+		event.currentScope = scope;
+		scope.$$fireEventOnScope(eventName, listenerArgs);
+		scope = scope.$parent;  // 通过改变scope引用 实现向上传播的关键代码
+	} while (scope && !propagationStopped);
+
+	event.currentScope = null;
+
+	return event;
+};
+
+/* propagating down */
+Scope.prototype.$broadcast = function(eventName) {
+	var event = {
+		name: eventName,
+		targetScope: this,
+		preventDefault: function() {
+			event.defaultPrevented = true;
+		}
+	};
+
+	//  把event和additionalArgs拼接成新数组，通过apply方法传入listener, 使参数获取方式正常
+	var listenerArgs = [event].concat(_.tail(arguments));
+
+	this.$$everyScope(function(scope) {
+		event.currentScope = scope;
+		scope.$$fireEventOnScope(eventName, listenerArgs);
+		return true;
+	});
+
+	event.currentScope = null;
+
+	return event;
+};
+
+/*  $emit 和 $broadcast中 提取出的 fire event listener函数
+	angularjs源码没有这个方法，其中只是重复了这些代码, 本书作者提出了重复代码
+ */
+Scope.prototype.$$fireEventOnScope = function(eventName, listenerArgs) {
+
+	var listeners = this.$$listeners[eventName] || [];
+	var i = 0;
+
+	while(i < listeners.length) {
+		if(listeners[i] === null) {
+			listeners.splice(i, 1);
+		} else {
+			try {
+				listeners[i].apply(null, listenerArgs);
+			} catch(e) {
+				console.error(e);
+			}
+			i++;
+		}
+	}
+
+	return event;
+};
 
 module.exports = Scope;
