@@ -1,6 +1,7 @@
 'use strict';
 
 var _ = require('lodash');
+var parse = require('./parse');
 
 /* 初始化watcher.last */
 function initWatchVal() {}
@@ -24,6 +25,13 @@ function Scope() {
 /* $watch方法：向watchers数组中添加watcher对象，以便对应调用 */
 Scope.prototype.$watch = function(watchFn, listenerFn, valueEq) {
 	var self = this;
+
+	watchFn = parse(watchFn);
+
+	// watchDelegate: 针对watch expression是常量和 one-time-binding的情况，进行优化。在第一次初始化之后删除watch
+	if(watchFn.$$watchDelegate) {
+		return watchFn.$$watchDelegate(self, listenerFn, valueEq, watchFn);
+	}
 
 	var watcher = {
 		watchFn: watchFn,
@@ -108,6 +116,8 @@ Scope.prototype.$watchCollection = function(watchFn, listenerFn) {
 	var trackVeryOldValue = (listenerFn.length > 1);
 	var changeCount = 0;
 	var firstRun = true;
+
+	watchFn = parse(watchFn);
 
 	function isArrayLike(obj) {
 		if(_.isNull(obj) || _.isUndefined(obj)) {
@@ -289,7 +299,7 @@ Scope.prototype.$$areEqual = function(newValue, oldValue, valueEq) {
 
 /* scope上的方法实现 */
 Scope.prototype.$eval = function(expr, locals) {
-	return expr(this, locals);
+	return parse(expr)(this, locals);
 };
 
 Scope.prototype.$apply = function(expr) {
