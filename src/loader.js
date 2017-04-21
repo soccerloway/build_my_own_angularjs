@@ -1,5 +1,7 @@
 'use strict';
 
+var _ = require('lodash');
+
 function setupModuleLoader(window) {
 	var ensure = function(obj, name, factory) {
 		return obj[name] || (obj[name] = factory());
@@ -7,18 +9,46 @@ function setupModuleLoader(window) {
 
 	var angular = ensure(window, 'angular', Object);
 
-	var createModule = function(name, requires) {
+	var createModule = function(name, requires, modules) {
+		// 禁止注册 hasOwnProperty 为名字的module
+		if(name === 'hasOwnProperty') {
+			throw 'hasOwnProperty is not a valid module name';
+		}
+
+		var invokeQueue = [];  // 创建modules时, injector执行的队列 依赖注入
+
 		var moduleInstance = {
 			name: name,
-			requires: requires
+			requires: requires,
+			constant: function(key, value) {
+				invokeQueue.push(['constant', [key, value]]);
+			},
+			_invokeQueue: invokeQueue
 		};
 
+		modules[name] = moduleInstance;
 		return moduleInstance;
 	};
 
+	var getModule = function(name, modules) {
+		if(modules.hasOwnProperty(name)) {
+			return modules[name];
+		} else {
+			throw 'Module ' + name + ' is not available!';
+		}
+
+		return modules[name];
+	};
+
 	ensure(angular, 'module', function() {
+		var modules = {};
+
 		return function(name, requires) {
-			return createModule(name, requires);
+			if(requires) {
+				return createModule(name, requires, modules);
+			} else {
+				return getModule(name, modules);
+			}
 		};
 	});
 }
