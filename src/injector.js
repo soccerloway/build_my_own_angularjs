@@ -11,24 +11,46 @@ var FN_ARG = /^\s*(_?)(\S+?)\1\s*$/;
 // 丢掉注释 的正则
 var STRIP_COMMENTS = /(\/\/.*$)|(\/\*.*?\*\/)/mg;
 
+var INSTANTIATING = {};
+
 
 function createInjector(modulesToLoad, strictDi) {
-	var cache = {};
+	var providerCache = {};
+	var providerInjector = providerCache.$injector = createInternalInjector(providerCache, function() {
+		throw 'Unknown provider: ' + path.join(' <- ');
+	});
+
+	var instanceCache = {};
+	var instanceInjector = instanceCache.$injector = createInternalInjector(instanceCache, function(name) {
+		var provider = providerInjector.get(name + 'Provider');
+		return instanceInjector.invoke(provider.$get, provider);
+	});
+
 	var loadedModules = {};
+	var path = [];
+
 	strictDi = (strictDi === true);
 
-	var $provide = {
+	providerCache.$provide = {
 		constant: function(key, value) {
 			if(key === 'hasOwnProperty') {
 				throw 'hasOwnProperty is not a valid constant name!';
-			} else {
-				cache[key] = value;
 			}
+			
+			providerCache[key] = value;
+			instanceCache[key] = value;
+		},
+		provider: function(key, provider) {
+			if(_.isFunction(provider)) {
+				provider = providerInjector.instantiate(provider);
+			}
+
+			providerCache[key + 'Provider'] = provider;
 		}
 	};
 
 	// 这个函数中的3种处理分别对应了 angular中依赖注入的3种注释形式
-	// 分别是 ['x', 'x', fn], $inject = [], 无注入, 隐式注入 
+	// 分别是 ['x', 'x', fn], $inject = [], 隐式注入 
 	// 作用： 剥离出 依赖的module name数组
 	function annotate(fn) {
 		if(_.isArray(fn)) {
@@ -39,7 +61,7 @@ function createInjector(modulesToLoad, strictDi) {
 			return [];
 		} else {
 			if(strictDi) {
-				throw 'fn is not using explicit annotation and ' +
+				throw 'fn is not using explicit annotation and '+
 					'cannot be invoked in strict mode';
 			}
 
@@ -52,30 +74,85 @@ function createInjector(modulesToLoad, strictDi) {
 		}
 	}
 
-	// dependencies inject
-	function invoke(fn, self, locals) {
-		var args = _.map(annotate(fn), function(token) {
-			if(_.isString(token)) {
-				return locals && locals.hasOwnProperty(token) ? locals[token] : cache[token];
-			} else {
-				throw 'Incorrect injection token! Expected a string, got ' + token;
-			}
-		});
+	// 分类create injector，区分开provider injector和 instance injector
+	// 返回injector对象
+	function createInternalInjector(cache, factoryFn) {
 
-		if(_.isArray(fn)) {
-			fn = _.last(fn);
+		function getService(name) {
+			if(cache.hasOwnProperty(name)) {
+				// 检测是否存在环形依赖, 即 A依赖B B依赖C C依赖A
+				if(cache[name] === INSTANTIATING) {
+					throw new Error('Circular dependency found: ' +
+						name + ' <- ' + path.join(' <- '));
+				}
+
+				return cache[name];
+
+			} else {
+				path.unshift(name);
+				cache[name] = INSTANTIATING;
+
+				try {
+					return (cache[name] = factoryFn(name));
+				} finally {
+					path.shift();
+					if(cache[name] === INSTANTIATING) {
+						delete cache[name];
+					}
+				}
+			}
 		}
 
-		return fn.apply(self, args);
+		function invoke(fn, self, locals) {
+			// dependency lookup loop
+			var args = _.map(annotate(fn), function(token) {
+				if(_.isString(token)) {
+					return locals && locals.hasOwnProperty(token) ? locals[token] : getService(token);
+				} else {
+					throw 'Incorrect injection token! Expected a string, got ' + token;
+				}
+			});
+
+			if(_.isArray(fn)) {
+				fn = _.last(fn);
+			}
+
+			return fn.apply(self, args);
+		}
+
+		function instantiate(Type, locals) {
+		// var UnwrappedType = _.isArray(Type) ? _.last(Type) : Type;
+			var UnwrappedType = _.isArray(Type)? _.last(Type) : Type;
+			var instance = Object.create(UnwrappedType.prototype);
+			invoke(Type, instance, locals);
+			return instance;
+		}
+
+		return {
+			has: function(key) {
+				return cache.hasOwnProperty(key) ||
+					providerCache.hasOwnProperty(key + 'Provider');
+			},
+			get: getService,
+			annotate: annotate,
+			invoke: invoke,
+			instantiate: instantiate
+		};
+
 	}
 
-	// 配合DI实例化对象
-	function instantiate(Type) {
-		var instance = {};
-		invoke(Type, instance);
-		return instance;
+	function runInvokeQueue(queue) {
+		_.forEach(queue, function(invokeArgs) {
+
+			var service = providerInjector.get(invokeArgs[0]);
+			var method = invokeArgs[1];
+			var args = invokeArgs[2];
+
+			service[method].apply(service, args);
+		});
 	}
 
+	// injector核心代码
 	_.forEach(modulesToLoad, function loadModule(moduleName) {
 		if(!loadedModules.hasOwnProperty(moduleName)) {
 			loadedModules[moduleName] = true;
@@ -83,26 +160,13 @@ function createInjector(modulesToLoad, strictDi) {
 			var module = window.angular.module(moduleName);
 			_.forEach(module.requires, loadModule);
 
-			_.forEach(module._invokeQueue, function(invokeArgs) {
-				var method = invokeArgs[0];
-				var args = invokeArgs[1];
-				$provide[method].apply($provide, args);
-			});
+			// 循环执行 module._invokeQueue中注册的provider
+			runInvokeQueue(module._invokeQueue);
+			runInvokeQueue(module._configBlocks);
 		}
 	});
 
-	return {
-		has: function(key) {
-			return cache.hasOwnProperty(key);
-		},
-
-		get: function(key) {
-			return cache[key];
-		},
-		annotate: annotate,
-		invoke: invoke,
-		instantiate: instantiate
-	};
+	return instanceInjector;
 }
 
 
