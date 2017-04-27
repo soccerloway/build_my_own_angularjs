@@ -32,9 +32,19 @@ function setupModuleLoader(window) {
 			requires: requires,
 			constant: invokeLater('$provide', 'constant', 'unshift'),
 			provider: invokeLater('$provide', 'provider'),
+			factory: invokeLater('$provide', 'factory'),
+			value: invokeLater('$provide', 'value'),
+			service: invokeLater('$provide', 'service'),
+			decorator: invokeLater('$provide', 'decorator'),
+			filter: invokeLater('$filterProvider', 'register'),
 			config: invokeLater('$injector', 'invoke', 'push', configBlocks),
+			run: function(fn) {
+				moduleInstance._runBlocks.push(fn);
+				return moduleInstance;
+			},
 			_invokeQueue: invokeQueue,
-			_configBlocks: configBlocks
+			_configBlocks: configBlocks,
+			_runBlocks: []
 		};
 
 		if(configFn) {

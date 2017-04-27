@@ -1,6 +1,7 @@
 'use strict';
 
 var _ = require('lodash');
+var HashMap = require('./hash_map').HashMap;
 
 // 这个正则能去除函数的参数部分 但参数之前的whitespace被保留了
 var FN_ARGS = /^function\s*[^\(]*\(\s*([^\)]*)\)/m;
@@ -26,10 +27,21 @@ function createInjector(modulesToLoad, strictDi) {
 		return instanceInjector.invoke(provider.$get, provider);
 	});
 
-	var loadedModules = {};
+	var loadedModules = new HashMap();
 	var path = [];
 
 	strictDi = (strictDi === true);
+
+	// 确认factoryFn存在返回值 的工具方法，用于$provider.factory
+	function enforceReturnValue(factoryFn) {
+		return function() {
+			var value = instanceInjector.invoke(factoryFn);
+			if(_.isUndefined(value)) {
+				throw 'factory must return a value';
+			}
+			return value;
+		}
+	}
 
 	providerCache.$provide = {
 		constant: function(key, value) {
@@ -46,6 +58,31 @@ function createInjector(modulesToLoad, strictDi) {
 			}
 
 			providerCache[key + 'Provider'] = provider;
+		},
+		factory: function(key, factoryFn, enforce) {
+			this.provider(key, {
+				$get: enforce === false? factoryFn : enforceReturnValue(factoryFn)
+			});
+		},
+		value: function(key, value) {
+			this.factory(key, _.constant(value), false);
+		},
+		service: function(key, Constructor) {
+			this.factory(key, function() {
+				return instanceInjector.instantiate(Constructor);
+			});
+		},
+		decorator: function(serviceName, decoratorFn) {
+			var provider = providerInjector.get(serviceName + 'Provider');
+			var original$get = provider.$get;
+
+			provider.$get = function() {
+				var instance = instanceInjector.invoke(original$get, provider);
+				// 装饰器在这里起作用
+				instanceInjector.invoke(decoratorFn, null, {$delegate: instance});
+				
+				return instance;
+			}
 		}
 	};
 
@@ -153,17 +190,35 @@ function createInjector(modulesToLoad, strictDi) {
 	}
 
 	// injector核心代码
-	_.forEach(modulesToLoad, function loadModule(moduleName) {
-		if(!loadedModules.hasOwnProperty(moduleName)) {
-			loadedModules[moduleName] = true;
+	var runBlocks = [];
 
-			var module = window.angular.module(moduleName);
-			_.forEach(module.requires, loadModule);
+	// 这个for循环进行 dependencies loading, 依赖加载
+	_.forEach(modulesToLoad, function loadModule(module) {
+		if(!loadedModules.get(module)) {
+			loadedModules.put(module, true);
 
-			// 循环执行 module._invokeQueue中注册的provider
-			runInvokeQueue(module._invokeQueue);
-			runInvokeQueue(module._configBlocks);
+			if(_.isString(module)) {
+				module = window.angular.module(module);
+				_.forEach(module.requires, loadModule);
+
+				// 循环执行 module._invokeQueue 和 module.configBlocks 中的任务
+				runInvokeQueue(module._invokeQueue);
+				runInvokeQueue(module._configBlocks);
+
+				runBlocks = runBlocks.concat(module._runBlocks);
+
+			} else if(_.isFunction(module) || _.isArray(module)) {
+				// 允许以function的形式向module中注入module
+				runBlocks.push(providerInjector.invoke(module));
+			}
 		}
+
+	});
+
+	// 通过instanceInjector 循环执行 runBlocks中的函数
+	// runBlocks中的函数执行位置在 依赖modules被加载完成之后
+	_.forEach(_.compact(runBlocks), function(runBlock) {
+		instanceInjector.invoke(runBlock);
 	});
 
 	return instanceInjector;
