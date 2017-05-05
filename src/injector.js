@@ -40,7 +40,7 @@ function createInjector(modulesToLoad, strictDi) {
 				throw 'factory must return a value';
 			}
 			return value;
-		}
+		};
 	}
 
 	providerCache.$provide = {
@@ -82,7 +82,7 @@ function createInjector(modulesToLoad, strictDi) {
 				instanceInjector.invoke(decoratorFn, null, {$delegate: instance});
 				
 				return instance;
-			}
+			};
 		}
 	};
 
