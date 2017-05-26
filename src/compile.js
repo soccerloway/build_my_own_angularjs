@@ -22,6 +22,9 @@ var BOOLEAN_ELEMENTS = {
 	DETAILS: true
 };
 
+// 匹配require的前缀
+var REQUIRE_PREFIX_REGEXP = /^(\^\^?)?(\?)?(\^\^?)?/;
+
 var _ = require('lodash');
 var $ = require('jquery');
 
@@ -66,10 +69,30 @@ function parseDirectiveBindings(directive) {
 			bindings.isolateScope = parseIsolateBindings(directive.scope);
 		}
 	}
+
+	if(_.isObject(directive.bindToController)) {
+		bindings.bindToController = parseIsolateBindings(directive.bindToController);
+	}
+
 	return bindings;
 }
 
+// 构造 合法的 require objects
+function getDirectiveRequire(directive, name) {
+	var require = directive.require || (directive.controller && name);
+	
+	if (!_.isArray(require) && _.isObject(require)) {
+		_.forEach(require, function(value, key) {
+			var prefix = value.match(REQUIRE_PREFIX_REGEXP);
+			var name = value.substring(prefix[0].length);
 
+			if (!name) {
+				require[key] = prefix[0] + key;
+			}
+		}); 
+	}
+	return require;
+}
 
 
 
@@ -101,6 +124,7 @@ function $CompileProvider($provide) {
 						// 处理attributes bindings: parseIsolateBindings
 						directive.$$bindings = parseDirectiveBindings(directive);
 						directive.name = directive.name || name;
+						directive.require = getDirectiveRequire(directive, name);
 						directive.index = i;
 						return directive;
 					});
@@ -117,7 +141,7 @@ function $CompileProvider($provide) {
 	};
 
 
-	this.$get = ['$injector', '$parse', '$controller', '$rootScope', function($injector, $parse, $controller, $rootScope) {
+	this.$get = ['$injector', '$parse', '$controller', '$rootScope', '$http', function($injector, $parse, $controller, $rootScope, $http) {
 
 		// 构造指令的attrs对象，同一个dom，不同指令会共享这一个attrs对象
 		function Attributes(element) {
@@ -386,22 +410,122 @@ function $CompileProvider($provide) {
 			return match;
 		}
 
+		// 通过templateUrl 异步获取tempalte，并恢复compilation
+		// denpend on: $http
+		function compileTemplateUrl(directives, $compileNode, attrs, previousCompileContext) {
+			var origAsyncDirective = directives.shift();
+			var derivedSynDirective = _.extend(
+				{},
+				origAsyncDirective,
+				{templateUrl: null}
+			);
+
+			var templateUrl = _.isFunction(origAsyncDirective.templateUrl) ?
+				origAsyncDirective.templateUrl($compileNode, attrs) :
+				origAsyncDirective.templateUrl;
+
+			var afterTemplateNodeLinkFn, afterTemplateChildLinkFn;
+			var linkQueue = [];
+
+			$compileNode.empty();
+			$http.get(templateUrl).success(function(template) {
+				directives.unshift(derivedSynDirective);
+				$compileNode.html(template);
+				afterTemplateNodeLinkFn = applyDirectivesToNode(directives, $compileNode, attrs, previousCompileContext);
+				afterTemplateChildLinkFn = compileNodes($compileNode[0].childNodes);
+
+				_.forEach(linkQueue, function(linkCall) {
+					afterTemplateNodeLinkFn(
+						afterTemplateChildLinkFn,
+						linkCall.scope,
+						linkCall.linkNode
+					);
+				});
+
+				linkQueue = null;
+			});
+
+			return function delayedNodeLinkFn(_ignoreChildLinkFn, scope, linkNode) {
+				if(linkQueue) {
+					linkQueue.push({scope: scope, linkNode: linkNode});
+				} else {
+					afterTemplateNodeLinkFn(afterTemplateChildLinkFn, scope, linkNode);
+				}
+			};
+		}
+
 		// 指令实际compile函数
-		function applyDirectivesToNode(directives, compileNode, attrs) {
+		function applyDirectivesToNode(directives, compileNode, attrs, previousCompileContext) {
+			previousCompileContext = previousCompileContext || {};
 			var $compileNode = $(compileNode);
 			var terminalPriority = -Number.MAX_VALUE;
 			var terminal = false;
+			var preLinkFns = previousCompileContext.preLinkFns || [];
+			var postLinkFns = previousCompileContext.postLinkFns || [];
+			var controllers = {};
 			var linkFns = [];
-			var preLinkFns = [], postLinkFns = [], controllers = {};
-			var newScopeDirective, newIsolateScopeDirective;
-			var controllerDirectives;
+			var newScopeDirective;
+			var newIsolateScopeDirective = previousCompileContext.newIsolateScopeDirective;
+			var templateDirective = previousCompileContext.templateDirective;
+			var controllerDirectives = previousCompileContext.controllerDirectives;
 
-			function addLinkFns(preLinkFn, postLinkFn, attrStart, attrEnd, isolateScope) {
+			// require配置 获取controllers的实现
+			function getControllers(require, $element) {
+				if(_.isArray(require)) {
+					return _.map(require, function(r) {
+						return getControllers(r, $element);
+					});
+				} else if(_.isObject(require)) {
+					return _.mapValues(require, function(r) {
+						return getControllers(r, $element);
+					});
+				} else {
+					var value;
+					var match = require.match(REQUIRE_PREFIX_REGEXP);
+					var optional = match[2];
+
+					require = require.substring(match[0].length);
+					// 从祖先元素上找匹配的指令controller
+					if(match[1] || match[3]) {
+						if(match[3] && !match[1]) {
+							match[1] = match[3];
+						}
+
+						if(match[1] === '^^') {
+							$element = $element.parent();
+						}
+
+						while($element.length) {
+							value = $element.data('$' + require + 'Controller');
+							if(value) {
+								break;
+							} else {
+								$element = $element.parent();
+							}
+						}
+
+
+					} else {
+						if(controllers[require]) {
+							value = controllers[require].instance;
+						}
+					}
+
+					if(!value && !optional) {
+						throw 'Controller ' + require + ' required by directive, cannot be found!';
+					}
+
+					return value || null;
+				}
+			}
+
+			function addLinkFns(preLinkFn, postLinkFn, attrStart, attrEnd, isolateScope, require) {
 				if(preLinkFn) {
 					if(attrStart) {
 						preLinkFn = groupElementsLinkFnWrapper(preLinkFn, attrStart, attrEnd);
 					}
 					preLinkFn.isolateScope = isolateScope;
+					preLinkFn.require = require;
 					preLinkFns.push(preLinkFn);
 				}
 				if(postLinkFn) {
@@ -409,11 +533,12 @@ function $CompileProvider($provide) {
 						postLinkFn = groupElementsLinkFnWrapper(postLinkFn, attrStart, attrEnd);
 					}
 					postLinkFn.isolateScope = isolateScope;
+					postLinkFn.require = require;
 					postLinkFns.push(postLinkFn);
 				}
 			}
 
-			_.forEach(directives, function(directive) {
+			_.forEach(directives, function(directive, i) {
 				if(directive.$$start) {
 					$compileNode = groupScan(compileNode, directive.$$start, directive.$$end);
 				}
@@ -423,7 +548,7 @@ function $CompileProvider($provide) {
 				}
 
 				// 一个element上的多个directive的scope创建规则
-				if(directive.scope) {
+				if(directive.scope && !directive.templateUrl) {
 					if(_.isObject(directive.scope)) {
 						if(newIsolateScopeDirective || newScopeDirective) {
 							throw 'Multiple directives asking for new/inherited scope';
@@ -439,20 +564,57 @@ function $CompileProvider($provide) {
 					}
 				}
 
-				if(directive.compile) {
+				// 指令template原理简单来说，就是如果directive defination object
+				// 中有template配置，就拿template中的html string通过replace元素中的html
+				// 即innerHTML替换
+				if(directive.template) {
+					if(templateDirective) {
+						throw 'Multiple directives asking for template';
+					}
+
+					templateDirective = directive;
+					$compileNode.html(_.isFunction(directive.template) ?
+						directive.template($compileNode, attrs) :
+						directive.template);
+				}
+
+				// 当定义templateUrl存在时，退出foreach循环，准备异步请求模版后再compile
+				if(directive.templateUrl) {
+					if(templateDirective) {
+						throw 'Multiple directives asking for template';
+					}
+
+					templateDirective = directive;
+					nodeLinkFn = compileTemplateUrl(
+						_.drop(directives, i),
+						$compileNode,
+						attrs,
+						{
+							templateDirective: templateDirective,
+							newIsolateScopeDirective: newIsolateScopeDirective,
+							controllerDirectives: controllerDirectives,
+							preLinkFns: preLinkFns,
+							postLinkFns: postLinkFns
+						}
+					);
+					return false;
+				} else if(directive.compile) {
 					// 这里link单个指令
 					var linkFn = directive.compile($compileNode, attrs);
 					var isolateScope = (directive === newIsolateScopeDirective);
 					var attrStart = directive.$$start;
 					var attrEnd = directive.$$end;
+					var require = directive.require;
 
 					if(_.isFunction(linkFn)) {
-						addLinkFns(null, linkFn, attrStart, attrEnd, isolateScope);
+						addLinkFns(null, linkFn, attrStart, attrEnd, isolateScope, require);
 					} else if(linkFn) {
-						addLinkFns(linkFn.pre, linkFn.post, attrStart, attrEnd, isolateScope);
+						addLinkFns(linkFn.pre, linkFn.post, attrStart, attrEnd, isolateScope, require);
 					}
 				}
 
+
+				//  teriminal为true的指令会中止这个dom上的compile
 				if(directive.terminal) {
 					terminal = true;
 					terminalPriority = directive.priority;
@@ -494,8 +656,15 @@ function $CompileProvider($provide) {
 							controllerName = attrs[directive.name];
 						}
 
-						controllers[directive.name] =	
-							$controller(controllerName, locals, true, directive.controllerAs);
+						var controller = $controller(
+							controllerName,
+							locals,
+							true,
+							directive.controllerAs
+						);
+
+						controllers[directive.name] = controller;
+						$element.data('$' + directive.name + 'Controller', controller.instance);
 					});
 				}
 
@@ -510,12 +679,13 @@ function $CompileProvider($provide) {
 					);
 				}
 
-				if(newIsolateScopeDirective && controllers[newIsolateScopeDirective.name]) {
+				var scopeDirective = newIsolateScopeDirective || newScopeDirective;
+				if(scopeDirective && controllers[scopeDirective.name]) {
 					initializeDirectiveBindings(
 						scope,
 						attrs,
-						controllers[newIsolateScopeDirective.name].instance,
-						newIsolateScopeDirective.$$bindings.bindToController,
+						controllers[scopeDirective.name].instance,
+						scopeDirective.$$bindings.bindToController,
 						isolateScope
 					);
 				}
@@ -525,19 +695,46 @@ function $CompileProvider($provide) {
 					controller();
 				});
 
+				_.forEach(controllerDirectives, function(controllerDirective, name) {
+					var require = controllerDirective.require;
+					if(_.isObject(require) && !_.isArray(require) &&
+						controllerDirective.bindToController) {
+						var controller = controllers[controllerDirective.name].instance;
+						var requiredControllers = getControllers(require, $element);
+						_.assign(controller, requiredControllers);
+					}
+				});
+
 				/* 这里是各个linkFn的执行
 				* 可以看出执行顺序为 parentPreLink, childPreLink, childPostLink, parentPostLink
 				 */
 				_.forEach(preLinkFns, function(linkFn) {
-					linkFn(linkFn.isolateScope ? isolateScope : scope, $element, attrs);
+					linkFn(
+						linkFn.isolateScope ? isolateScope : scope,
+						$element,
+						attrs,
+						linkFn.require && getControllers(linkFn.require, $element)
+					);
 				});
 
 				if(childLinkFn) {
-					childLinkFn(scope, linkNode.childNodes);
+					var scopeToChild = scope;
+					if(newIsolateScopeDirective &&
+						(newIsolateScopeDirective.template ||
+						newIsolateScopeDirective.templateUrl === null)) {
+						scopeToChild = isolateScope;
+					}
+
+					childLinkFn(scopeToChild, linkNode.childNodes);
 				}
 
 				_.forEachRight(postLinkFns, function(linkFn) {
-					linkFn(linkFn.isolateScope ? isolateScope : scope, $element, attrs);
+					linkFn(
+						linkFn.isolateScope ? isolateScope : scope,
+						$element,
+						attrs,
+						linkFn.require && getControllers(linkFn.require, $element)
+					);
 				});
 			}
 
@@ -655,9 +852,9 @@ function $CompileProvider($provide) {
 		}
 
 		function groupElementsLinkFnWrapper(linkFn, attrStart, attrEnd) {
-			return function(scope, element, attrs) {
+			return function(scope, element, attrs, ctrl) {
 				var group = groupScan(element[0], attrStart, attrEnd);
-				return linkFn(scope, group, attrs);
+				return linkFn(scope, group, attrs, ctrl);
 			};
 		}
 
