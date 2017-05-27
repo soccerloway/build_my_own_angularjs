@@ -232,9 +232,29 @@ function $CompileProvider($provide) {
 			var compositeLinkFn = compileNodes($compileNodes);
 
 			// publicLinkFn link整个compile出的dom树
-			return function publicLinkFn(scope) {
-				$compileNodes.data('$scope', scope);
-				compositeLinkFn(scope, $compileNodes);
+			return function publicLinkFn(scope, cloneAttachFn, options) {
+				options = options || {};
+				var parentBoundTranscludeFn = options.parentBoundTranscludeFn;
+
+				if(parentBoundTranscludeFn && parentBoundTranscludeFn.$$boundTransclude) {
+					parentBoundTranscludeFn = parentBoundTranscludeFn.$$boundTransclude;
+				}
+
+				var $linkNodes;
+
+				if(cloneAttachFn) {
+					$linkNodes = $compileNodes.clone();
+					cloneAttachFn($linkNodes, scope);
+				} else {
+					$linkNodes = $compileNodes;
+				}
+
+				$linkNodes.data('$scope', scope);
+
+				// 真正的link dom阶段
+				compositeLinkFn(scope, $linkNodes, parentBoundTranscludeFn);
+
+				return  $linkNodes;
 			};
 		}
 
@@ -268,8 +288,8 @@ function $CompileProvider($provide) {
 				}
 			});
 
-			// compositeLinkFn link节点集合 执行了所有的linkFn
-			function compositeLinkFn(scope, linkNodes) {
+			// compositeLinkFn link节点集合 此函数调用会执行所有的linkFn
+			function compositeLinkFn(scope, linkNodes, parentBoundTranscludeFn) {
 				var stableNodeList = [];
 				_.forEach(linkFns, function(linkFn) {
 					var nodeIdx = linkFn.idx;
@@ -281,20 +301,39 @@ function $CompileProvider($provide) {
 					var node = stableNodeList[linkFn.idx];
 
 					if(linkFn.nodeLinkFn) {
+						var childScope;
+
 						if(linkFn.nodeLinkFn.scope) {
-							scope = scope.$new();
-							$(node).data('$scope', scope);
+							childScope = scope.$new();
+							$(node).data('$scope', childScope);
+						} else {
+							childScope = scope;
+						}
+
+						var boundTranscludeFn;
+						if(linkFn.nodeLinkFn.transcludeOnThisElement) {
+							boundTranscludeFn = function(transcludedScope, cloneAttachFn, containingScope) {
+								if(!transcludedScope) {
+									transcludedScope = scope.$new(false, containingScope);
+								}
+								
+								return linkFn.nodeLinkFn.transclude(transcludedScope, cloneAttachFn);
+							};
+						} else if(parentBoundTranscludeFn) {
+							boundTranscludeFn = parentBoundTranscludeFn;
 						}
 
 						linkFn.nodeLinkFn(
 							linkFn.childLinkFn,
-							scope,
-							node
+							childScope,
+							node,
+							boundTranscludeFn
 						);
 					} else {
 						linkFn.childLinkFn(
 							scope,
-							node.childNodes
+							node.childNodes,
+							parentBoundTranscludeFn
 						);
 					}
 				});
@@ -468,6 +507,7 @@ function $CompileProvider($provide) {
 			var newIsolateScopeDirective = previousCompileContext.newIsolateScopeDirective;
 			var templateDirective = previousCompileContext.templateDirective;
 			var controllerDirectives = previousCompileContext.controllerDirectives;
+			var childTranscludeFn, hasTranscludeDirective;
 
 			// require配置 获取controllers的实现
 			function getControllers(require, $element) {
@@ -564,6 +604,29 @@ function $CompileProvider($provide) {
 					}
 				}
 
+				// 获得对象 dirName: directive definition object
+				// nodeLinkFn中实例化controller用到
+				if(directive.controller) {
+					controllerDirectives = controllerDirectives || {};
+					controllerDirectives[directive.name] = directive;
+				}
+
+				// transclusion
+				if(directive.transclude) {
+					if(hasTranscludeDirective) {
+						throw 'Multiple directive asking for transclude';
+					}
+
+					hasTranscludeDirective = true;
+					var $transcludedNodes = $compileNode.clone().contents();
+					childTranscludeFn = compile($transcludedNodes);
+					// 追加说明：
+					// 实际上，transcludeFn 就是嵌入html片段的 linkFn
+
+					$compileNode.empty();
+				}
+
+
 				// 指令template原理简单来说，就是如果directive defination object
 				// 中有template配置，就拿template中的html string通过replace元素中的html
 				// 即innerHTML替换
@@ -620,16 +683,10 @@ function $CompileProvider($provide) {
 					terminalPriority = directive.priority;
 				}
 
-				// 获得对象 dirName: directive definition object
-				// nodeLinkFn中实例化controller用到
-				if(directive.controller) {
-					controllerDirectives = controllerDirectives || {};
-					controllerDirectives[directive.name] = directive;
-				}
 			});
 
 			// link单个节点上的所有指令
-			function nodeLinkFn(childLinkFn, scope, linkNode) {
+			function nodeLinkFn(childLinkFn, scope, linkNode, boundTranscludeFn) {
 				var $element = $(linkNode);
 
 				var isolateScope;
@@ -648,6 +705,7 @@ function $CompileProvider($provide) {
 						var locals = {
 							$scope: directive === newIsolateScopeDirective ? isolateScope:scope,
 							$element: $element,
+							$transclude: scopeBoundTranscludeFn,
 							$attrs: attrs
 						};
 
@@ -705,6 +763,12 @@ function $CompileProvider($provide) {
 					}
 				});
 
+				// 支持向$transclude函数 传入scope进行绑定
+				function scopeBoundTranscludeFn(transcludedScope, cloneAttachFn) {
+					return boundTranscludeFn(transcludedScope, cloneAttachFn, scope);
+				}
+				scopeBoundTranscludeFn.$$boundTransclude = boundTranscludeFn;
+
 				/* 这里是各个linkFn的执行
 				* 可以看出执行顺序为 parentPreLink, childPreLink, childPostLink, parentPostLink
 				 */
@@ -713,7 +777,8 @@ function $CompileProvider($provide) {
 						linkFn.isolateScope ? isolateScope : scope,
 						$element,
 						attrs,
-						linkFn.require && getControllers(linkFn.require, $element)
+						linkFn.require && getControllers(linkFn.require, $element),
+						scopeBoundTranscludeFn
 					);
 				});
 
@@ -725,7 +790,7 @@ function $CompileProvider($provide) {
 						scopeToChild = isolateScope;
 					}
 
-					childLinkFn(scopeToChild, linkNode.childNodes);
+					childLinkFn(scopeToChild, linkNode.childNodes, boundTranscludeFn);
 				}
 
 				_.forEachRight(postLinkFns, function(linkFn) {
@@ -733,13 +798,16 @@ function $CompileProvider($provide) {
 						linkFn.isolateScope ? isolateScope : scope,
 						$element,
 						attrs,
-						linkFn.require && getControllers(linkFn.require, $element)
+						linkFn.require && getControllers(linkFn.require, $element),
+						scopeBoundTranscludeFn
 					);
 				});
 			}
 
 			nodeLinkFn.terminal = terminal;
 			nodeLinkFn.scope = newScopeDirective && newScopeDirective.scope;
+			nodeLinkFn.transcludeOnThisElement = hasTranscludeDirective;
+			nodeLinkFn.transclude = childTranscludeFn;
 
 			return nodeLinkFn;
 		}
