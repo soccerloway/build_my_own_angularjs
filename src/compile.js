@@ -456,7 +456,10 @@ function $CompileProvider($provide) {
 			var derivedSynDirective = _.extend(
 				{},
 				origAsyncDirective,
-				{templateUrl: null}
+				{
+					templateUrl: null,
+					transclude: null
+				}
 			);
 
 			var templateUrl = _.isFunction(origAsyncDirective.templateUrl) ?
@@ -477,18 +480,19 @@ function $CompileProvider($provide) {
 					afterTemplateNodeLinkFn(
 						afterTemplateChildLinkFn,
 						linkCall.scope,
-						linkCall.linkNode
+						linkCall.linkNode,
+						linkCall.boundTranscludeFn
 					);
 				});
 
 				linkQueue = null;
 			});
 
-			return function delayedNodeLinkFn(_ignoreChildLinkFn, scope, linkNode) {
+			return function delayedNodeLinkFn(_ignoreChildLinkFn, scope, linkNode, boundTranscludeFn) {
 				if(linkQueue) {
-					linkQueue.push({scope: scope, linkNode: linkNode});
+					linkQueue.push({scope: scope, linkNode: linkNode, boundTranscludeFn: boundTranscludeFn});
 				} else {
-					afterTemplateNodeLinkFn(afterTemplateChildLinkFn, scope, linkNode);
+					afterTemplateNodeLinkFn(afterTemplateChildLinkFn, scope, linkNode, boundTranscludeFn);
 				}
 			};
 		}
@@ -508,6 +512,7 @@ function $CompileProvider($provide) {
 			var templateDirective = previousCompileContext.templateDirective;
 			var controllerDirectives = previousCompileContext.controllerDirectives;
 			var childTranscludeFn, hasTranscludeDirective;
+			var hasTranscludeDirective = previousCompileContext.hasTranscludeDirective;
 
 			// require配置 获取controllers的实现
 			function getControllers(require, $element) {
@@ -656,6 +661,7 @@ function $CompileProvider($provide) {
 							templateDirective: templateDirective,
 							newIsolateScopeDirective: newIsolateScopeDirective,
 							controllerDirectives: controllerDirectives,
+							hasTranscludeDirective: hasTranscludeDirective,
 							preLinkFns: preLinkFns,
 							postLinkFns: postLinkFns
 						}
@@ -765,6 +771,12 @@ function $CompileProvider($provide) {
 
 				// 支持向$transclude函数 传入scope进行绑定
 				function scopeBoundTranscludeFn(transcludedScope, cloneAttachFn) {
+					if(!transcludedScope || !transcludedScope.$watch ||
+						!transcludedScope.$evalAsync) {
+						cloneAttachFn = transcludedScope;
+						transcludedScope = undefined;
+					}
+
 					return boundTranscludeFn(transcludedScope, cloneAttachFn, scope);
 				}
 				scopeBoundTranscludeFn.$$boundTransclude = boundTranscludeFn;
